@@ -51,7 +51,37 @@ def review_contract(spec: dict, ai) -> list[dict]:
          "/paths/~1orders/get" is spec["paths"]["/orders"]["get"].
          It is not "//orders" -- the slash belongs to the key name "/orders".
     """
-    return ai.ask("contract_review", spec)
+    findings = ai.ask("contract_review", spec)
+    kept = []
+    for f in findings:
+        path = f.get("path")
+        method = f.get("method")
+
+        # Check 1: the path and method must exist in the spec
+        if path not in spec["paths"]:
+            continue
+        if method not in spec["paths"][path]:
+            continue
+
+        # Check 2: the evidence_pointer must lead to a real place in the spec
+        pointer = f.get("evidence_pointer", "")
+        parts = pointer.split("/")[1:]
+        current = spec
+        found = True
+        for part in parts:
+            part = part.replace("~1", "/").replace("~0", "~")
+            try:
+                if isinstance(current, list):
+                    current = current[int(part)]
+                else:
+                    current = current[part]
+            except (KeyError, IndexError, ValueError, TypeError):
+                found = False
+                break
+
+        if found:
+            kept.append(f)
+    return kept
 
 
 def design_negative_tests(spec: dict, ai) -> list[dict]:
@@ -86,7 +116,31 @@ def design_negative_tests(spec: dict, ai) -> list[dict]:
       3. The case has all required fields: name, method, path, input,
          expected_status.
     """
-    return ai.ask("negative_tests", spec)
+    cases = ai.ask("negative_tests", spec)
+    required_fields = ["name", "method", "path", "input", "expected_status"]
+    allowed_statuses = [400, 401, 403, 404, 409, 422]
+    kept = []
+    for c in cases:
+        # Rule 1: all required fields must be present
+        missing = False
+        for field in required_fields:
+            if field not in c:
+                missing = True
+        if missing:
+            continue
+
+        # Rule 2: the path and method must exist in the spec
+        if c["path"] not in spec["paths"]:
+            continue
+        if c["method"] not in spec["paths"][c["path"]]:
+            continue
+
+        # Rule 3: expected_status must be an error code we allow
+        if c["expected_status"] not in allowed_statuses:
+            continue
+
+        kept.append(c)
+    return kept
 
 
 def diagnose_incident(logs: str, ai) -> dict:
@@ -112,7 +166,10 @@ def diagnose_incident(logs: str, ai) -> dict:
     appears literally somewhere inside the logs string.
     The log file is at  data/incident.log  -- open it to see what is there.
     """
-    return ai.ask("incident_diagnosis", logs)[0]   # [0] is unverified; fix it
+    for d in ai.ask("incident_diagnosis", logs):
+      if d.get("evidence") and all(line in logs for line in d["evidence"]):
+        return d
+    return {}
 
 
 def review_migration(v1: dict, v2: dict, ai) -> list[dict]:
@@ -154,5 +211,62 @@ def review_migration(v1: dict, v2: dict, ai) -> list[dict]:
                                      and True in v2.
       "schema_changed"          -- parameter["schema"] differs between v1 and v2.
                                    If the schemas are identical the claim is false.
+      "security_added"          -- operation has no security in v1 and
+                                   requires security in v2.
     """
-    return ai.ask("migration_review", {"v1": v1, "v2": v2})
+    claims = ai.ask("migration_review", {"v1": v1, "v2": v2})
+    kept = []
+    for c in claims:
+        kind = c.get("kind")
+        path = c.get("path")
+        method = c.get("method")
+
+        # Look up the operation in each version (None if it doesn't exist)
+        v1_op = v1["paths"].get(path, {}).get(method)
+        v2_op = v2["paths"].get(path, {}).get(method)
+
+        # Rule 1: operation_removed -- must exist in v1 and be gone in v2
+        if kind == "operation_removed":
+            if v1_op is not None and v2_op is None:
+                kept.append(c)
+            continue
+
+        # The remaining claims need the operation in both versions
+        if v1_op is None or v2_op is None:
+            continue
+
+        # Rule 4: security_added -- no auth in v1, auth required in v2
+        # (operation-level "security" overrides the spec-wide default)
+        if kind == "security_added":
+            v1_security = v1_op.get("security", v1.get("security", []))
+            v2_security = v2_op.get("security", v2.get("security", []))
+            if not v1_security and v2_security:
+                kept.append(c)
+            continue
+
+        v1_param = _find_parameter(v1_op, c.get("parameter"))
+        v2_param = _find_parameter(v2_op, c.get("parameter"))
+        if v1_param is None or v2_param is None:
+            continue
+
+        # Rule 2: parameter_became_required -- optional in v1, required in v2
+        if kind == "parameter_became_required":
+            if not v1_param.get("required", False) and v2_param.get("required", False):
+                kept.append(c)
+
+        # Rule 3: schema_changed -- the schemas must actually differ
+        # (e.g. orderId is {"type": "string"} in both, so BREAK-003 is dropped)
+        elif kind == "schema_changed":
+            if v1_param.get("schema") != v2_param.get("schema"):
+                kept.append(c)
+
+        # Any other kind can't be verified, so it is dropped
+    return kept
+
+
+def _find_parameter(operation: dict, name: str) -> dict | None:
+    """Return the parameter called `name` from an operation, or None."""
+    for p in operation.get("parameters", []):
+        if p.get("name") == name:
+            return p
+    return None
